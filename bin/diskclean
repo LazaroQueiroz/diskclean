@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+# diskclean — tiered, dry-run-by-default disk cleanup.
+#
+#   diskclean                 show disk usage report (no changes)
+#   diskclean safe [--run]    clear regenerable caches (pacman, yay, pip, npm, go, docker, journal)
+#   diskclean compress DIR [--run]
+#                             zstd-compress large .csv/.log/.json files under DIR (lossless,
+#                             original removed only after the archive verifies)
+#   diskclean artifacts DIR [--run]
+#                             remove node_modules/venv/.venv/build dirs in projects untouched for 60+ days
+#   diskclean downloads       list Downloads items older than 90 days for manual review
+#
+# Without --run nothing is changed.
+
+set -uo pipefail
+
+RUN=0
+for a in "$@"; do [[ $a == --run ]] && RUN=1; done
+args=()
+for a in "$@"; do [[ $a != --run ]] && args+=("$a"); done
+set -- "${args[@]}"
+
+do_() {
+    if ((RUN)); then echo "+ $*"; "$@"; else echo "[dry-run] $*"; fi
+}
+
+report() {
+    df -h / | tail -1 | awk '{print "Root: "$3" used / "$2" ("$5"), "$4" free"}'
+    echo
+    du -xh --max-depth=1 "$HOME" 2>/dev/null | sort -rh | head -15
+    echo
+    du -sh /var/cache/pacman/pkg "$HOME/.cache" /var/log/journal 2>/dev/null
+}
+
+safe() {
+    echo "== pacman cache (keeps currently installed versions)"
+    do_ sudo pacman -Sc --noconfirm
+    echo "== yay build cache"
+    do_ yay -Sc --aur --noconfirm
+    echo "== language caches"
+    command -v pip  >/dev/null && do_ pip cache purge
+    command -v npm  >/dev/null && do_ npm cache clean --force
+    command -v go   >/dev/null && do_ go clean -cache
+    [[ -d $HOME/.gradle/caches ]] && do_ rm -rf "$HOME/.gradle/caches/build-cache-1"
+    echo "== app caches (rebuilt on next launch)"
+    for d in "$HOME/.cache/spotify" "$HOME/.cache/chromium" "$HOME/.cache/mozilla" \
+             "$HOME/.config/discord/Cache" "$HOME/.config/discord/Code Cache" \
+             "$HOME/.config/Slack/Cache" "$HOME/.config/Slack/Code Cache" \
+             "$HOME/.cache/ms-playwright-go" "$HOME/.cache/go-build"; do
+        [[ -d $d ]] && do_ rm -rf "$d"
+    done
+    echo "== docker (unused images, stopped containers; volumes untouched)"
+    command -v docker >/dev/null && do_ docker system prune -a -f
+    echo "== systemd journal (keep 200M)"
+    do_ sudo journalctl --vacuum-size=200M
+    echo "== orphan packages (review this list before running with --run)"
+    pacman -Qtdq
+    if ((RUN)) && [[ -n $(pacman -Qtdq) ]]; then sudo pacman -Rns $(pacman -Qtdq); fi
+}
+
+compress() {
+    local dir=${1:?usage: diskclean compress DIR [--run]}
+    find "$dir" -type f \( -name '*.csv' -o -name '*.log' -o -name '*.json' -o -name '*.txt' \) \
+        -size +50M -print0 |
+    while IFS= read -r -d '' f; do
+        echo "$(du -h "$f" | cut -f1)  $f"
+        # zstd --rm deletes the original only after a successful write; we also verify explicitly
+        if ((RUN)); then
+            zstd -T0 -10 -q "$f" -o "$f.zst" && zstd -t -q "$f.zst" && rm -- "$f" \
+                || echo "!! failed on $f, original kept"
+        fi
+    done
+    ((RUN)) || echo "[dry-run] files above would be compressed to .zst (read with: zstdcat FILE.zst)"
+}
+
+artifacts() {
+    local dir=${1:?usage: diskclean artifacts DIR [--run]}
+    find "$dir" -xdev -type d \( -name node_modules -o -name venv -o -name .venv -o -name build \) \
+        -prune -not -path '*/.*/*' -not -path "$HOME/Downloads/*" -not -path '*/resources/*' \
+        -print0 2>/dev/null |
+    while IFS= read -r -d '' d; do
+        local proj; proj=$(dirname "$d")
+        # skip projects with any non-artifact file modified in the last 60 days
+        if [[ -z $(find "$proj" -path "$d" -prune -o -type f -mtime -60 -print -quit 2>/dev/null) ]]; then
+            echo "$(du -sh "$d" | cut -f1)  $d"
+            do_ rm -rf -- "$d"
+        fi
+    done
+}
+
+downloads() {
+    echo "Items in ~/Downloads not modified in 90+ days (largest first):"
+    find "$HOME/Downloads" -mindepth 1 -maxdepth 1 -mtime +90 -print0 |
+        xargs -0 -r du -sh | sort -rh
+}
+
+case ${1:-} in
+    "")        report ;;
+    safe)      safe ;;
+    compress)  compress "${2:-}" ;;
+    artifacts) artifacts "${2:-}" ;;
+    downloads) downloads ;;
+    *)         sed -n '2,17p' "$0"; exit 1 ;;
+esac
