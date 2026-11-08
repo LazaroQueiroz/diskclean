@@ -34,6 +34,14 @@ report() {
 
 safe() {
     echo "== pacman cache (keeps currently installed versions)"
+    # pacman 7 downloads into download-XXXXXX dirs; interrupted runs leave them
+    # behind and `pacman -Sc` then errors on each one ("Error reading fd").
+    # Remove empty leftovers, but only when no pacman transaction holds the lock.
+    if [[ -e /var/lib/pacman/db.lck ]]; then
+        echo "pacman is running (db.lck present); skipping stale download dir cleanup"
+    else
+        do_ sudo find /var/cache/pacman/pkg -maxdepth 1 -type d -name 'download-*' -empty -delete
+    fi
     do_ sudo pacman -Sc --noconfirm
     echo "== yay build cache"
     do_ yay -Sc --aur --noconfirm
