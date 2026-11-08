@@ -4,7 +4,7 @@
 #   diskclean                 show disk usage report (no changes)
 #   diskclean safe [--run]    clear regenerable caches (pacman, yay, pip, npm, go, docker, journal)
 #   diskclean compress DIR [--run]
-#                             zstd-compress large .csv/.log/.json files under DIR (lossless,
+#                             zstd-compress .csv/.log/.json/.txt files >50M under DIR (lossless,
 #                             original removed only after the archive verifies)
 #   diskclean artifacts DIR [--run]
 #                             remove node_modules/venv/.venv/build dirs in projects untouched for 60+ days
@@ -100,5 +100,6 @@ case ${1:-} in
     compress)  compress "${2:-}" ;;
     artifacts) artifacts "${2:-}" ;;
     downloads) downloads ;;
-    *)         sed -n '2,17p' "$0"; exit 1 ;;
+    -h|--help|help) sed -n "2,13s/^# \\{0,1\\}//p" "$0" ;;
+    *)         sed -n "2,13s/^# \\{0,1\\}//p" "$0" >&2; exit 1 ;;
 esac
