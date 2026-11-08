@@ -2,26 +2,96 @@
 # diskclean — tiered, dry-run-by-default disk cleanup.
 #
 #   diskclean                 show disk usage report (no changes)
-#   diskclean safe [--run]    clear regenerable caches (pacman, yay, pip, npm, go, docker, journal)
-#   diskclean compress DIR [--run]
+#   diskclean safe [--run|-i] clear regenerable caches (pacman, yay, pip, npm, go, docker, journal)
+#   diskclean compress DIR [--run|-i]
 #                             zstd-compress .csv/.log/.json/.txt files >50M under DIR (lossless,
 #                             original removed only after the archive verifies)
-#   diskclean artifacts DIR [--run]
+#   diskclean artifacts DIR [--run|-i]
 #                             remove node_modules/venv/.venv/build dirs in projects untouched for 60+ days
 #   diskclean downloads       list Downloads items older than 90 days for manual review
 #
-# Without --run nothing is changed.
+# Without --run nothing is changed. With -i/--interactive each action is explained
+# (what it modifies, its size, its impact) and applied only if you answer yes.
 
 set -uo pipefail
 
-RUN=0
-for a in "$@"; do [[ $a == --run ]] && RUN=1; done
+RUN=0 INTERACTIVE=0
 args=()
-for a in "$@"; do [[ $a != --run ]] && args+=("$a"); done
-set -- "${args[@]}"
+for a in "$@"; do
+    case $a in
+        --run) RUN=1 ;;
+        -i|--interactive) INTERACTIVE=1 ;;
+        *) args+=("$a") ;;
+    esac
+done
+set -- "${args[@]+"${args[@]}"}"
+
+if ((INTERACTIVE)); then
+    if ! [[ -r /dev/tty ]] || ! { : </dev/tty; } 2>/dev/null; then
+        echo "diskclean: --interactive needs a terminal" >&2; exit 1
+    fi
+    RUN=0  # interactive decides per action
+fi
+
+APPLIED=0 SKIPPED=0
+
+if [[ -t 1 ]]; then
+    B=$'\e[1m' DIM=$'\e[2m' Y=$'\e[33m' G=$'\e[32m' R=$'\e[31m' N=$'\e[0m'
+else
+    B='' DIM='' Y='' G='' R='' N=''
+fi
 
 do_() {
     if ((RUN)); then echo "+ $*"; "$@"; else echo "[dry-run] $*"; fi
+}
+
+# Human-readable size of existing paths, or "?" if none can be measured.
+size_of() {
+    local p existing=()
+    for p in "$@"; do [[ -e $p ]] && existing+=("$p"); done
+    ((${#existing[@]})) || { echo "?"; return; }
+    du -csh "${existing[@]}" 2>/dev/null | tail -1 | cut -f1
+}
+
+# act TITLE MODIFIES IMPACT -- CMD...
+#   Non-interactive: same as do_ (dry-run unless --run).
+#   Interactive: describe the action and ask before running it.
+#   Answers: y = apply, n = skip (default), a = apply this and all remaining, q = quit.
+act() {
+    local title=$1 modifies=$2 impact=$3; shift 3
+    [[ ${1:-} == -- ]] && shift
+    if ! ((INTERACTIVE)); then do_ "$@"; return; fi
+
+    printf '\n%s▸ %s%s\n' "$B" "$title" "$N"
+    printf '  %sModifies:%s %s\n' "$Y" "$N" "$modifies"
+    printf '  %sImpact:%s   %s\n' "$Y" "$N" "$impact"
+    printf '  %sCommand:%s  %s%s%s\n' "$Y" "$N" "$DIM" "$*" "$N"
+
+    local ans
+    while :; do
+        printf '  Apply? [y/N/a/q] ' >/dev/tty
+        IFS= read -r ans </dev/tty || ans=q
+        case ${ans,,} in
+            y|yes) break ;;
+            ""|n|no) printf '  %sskipped%s\n' "$DIM" "$N"; ((++SKIPPED)); return 0 ;;
+            a|all) INTERACTIVE=0 RUN=1; echo "  applying this and all remaining actions"; break ;;
+            q|quit) summary; exit 0 ;;
+            *) echo "  y = apply, n = skip, a = apply all remaining, q = quit" ;;
+        esac
+    done
+    echo "+ $*"
+    if "$@"; then
+        printf '  %sdone%s\n' "$G" "$N"
+    else
+        printf '  %sfailed (exit %d)%s\n' "$R" "$?" "$N"
+    fi
+    ((++APPLIED))
+}
+
+summary() {
+    ((APPLIED + SKIPPED)) || return 0
+    printf '\n%s%d applied, %d skipped.%s\n' "$B" "$APPLIED" "$SKIPPED" "$N"
+    df -h / | tail -1 | awk '{print "Root now: "$3" used / "$2" ("$5"), "$4" free"}'
 }
 
 report() {
@@ -39,61 +109,118 @@ safe() {
     # Remove empty leftovers, but only when no pacman transaction holds the lock.
     if [[ -e /var/lib/pacman/db.lck ]]; then
         echo "pacman is running (db.lck present); skipping stale download dir cleanup"
-    else
-        do_ sudo find /var/cache/pacman/pkg -maxdepth 1 -type d -name 'download-*' -empty -delete
+    elif [[ -n $(find /var/cache/pacman/pkg -maxdepth 1 -type d -name 'download-*' -empty -print -quit 2>/dev/null) ]]; then
+        act "Remove stale pacman download dirs" \
+            "/var/cache/pacman/pkg/download-* (empty directories only)" \
+            "None; leftovers from interrupted downloads. Needs sudo." \
+            -- sudo find /var/cache/pacman/pkg -maxdepth 1 -type d -name 'download-*' -empty -delete
     fi
-    do_ sudo pacman -Sc --noconfirm
-    echo "== yay build cache"
-    do_ yay -Sc --aur --noconfirm
+    act "Clean pacman package cache" \
+        "/var/cache/pacman/pkg ($(size_of /var/cache/pacman/pkg) total)" \
+        "Deletes packages not currently installed; you can no longer downgrade to them offline. Needs sudo." \
+        -- sudo pacman -Sc --noconfirm
+    if command -v yay >/dev/null; then
+        echo "== yay build cache"
+        act "Clean yay AUR build cache" \
+            "$HOME/.cache/yay ($(size_of "$HOME/.cache/yay"))" \
+            "AUR packages must be re-downloaded and rebuilt on next update/reinstall." \
+            -- yay -Sc --aur --noconfirm
+    fi
     echo "== language caches"
-    command -v pip  >/dev/null && do_ pip cache purge
-    command -v npm  >/dev/null && do_ npm cache clean --force
-    command -v go   >/dev/null && do_ go clean -cache
-    [[ -d $HOME/.gradle/caches ]] && do_ rm -rf "$HOME/.gradle/caches/build-cache-1"
+    command -v pip >/dev/null && act "Purge pip cache" \
+        "$(pip cache dir 2>/dev/null) ($(size_of "$(pip cache dir 2>/dev/null)"))" \
+        "Next pip installs re-download wheels." \
+        -- pip cache purge
+    command -v npm >/dev/null && act "Clean npm cache" \
+        "$HOME/.npm/_cacache ($(size_of "$HOME/.npm/_cacache"))" \
+        "Next npm installs re-download packages." \
+        -- npm cache clean --force
+    command -v go >/dev/null && act "Clean Go build cache" \
+        "$(go env GOCACHE) ($(size_of "$(go env GOCACHE)"))" \
+        "Next Go builds and tests run slower while the cache rebuilds." \
+        -- go clean -cache
+    [[ -d $HOME/.gradle/caches/build-cache-1 ]] && act "Remove Gradle build cache" \
+        "$HOME/.gradle/caches/build-cache-1 ($(size_of "$HOME/.gradle/caches/build-cache-1"))" \
+        "Next Gradle builds recompile tasks instead of reusing cached outputs." \
+        -- rm -rf "$HOME/.gradle/caches/build-cache-1"
     echo "== app caches (rebuilt on next launch)"
     for d in "$HOME/.cache/spotify" "$HOME/.cache/chromium" "$HOME/.cache/mozilla" \
              "$HOME/.config/discord/Cache" "$HOME/.config/discord/Code Cache" \
              "$HOME/.config/Slack/Cache" "$HOME/.config/Slack/Code Cache" \
              "$HOME/.cache/ms-playwright-go" "$HOME/.cache/go-build"; do
-        [[ -d $d ]] && do_ rm -rf "$d"
+        [[ -d $d ]] && act "Remove app cache ${d#"$HOME"/}" \
+            "$d ($(size_of "$d"))" \
+            "Rebuilt on next launch; first start may be slower and offline media (e.g. Spotify downloads) is lost. Close the app first." \
+            -- rm -rf "$d"
     done
-    echo "== docker (unused images, stopped containers; volumes untouched)"
-    command -v docker >/dev/null && do_ docker system prune -a -f
+    if command -v docker >/dev/null; then
+        echo "== docker (unused images, stopped containers; volumes untouched)"
+        act "Prune Docker" \
+            "Stopped containers, unused networks, all images not used by a container, build cache" \
+            "Images must be pulled/rebuilt again. Volumes (data) are kept." \
+            -- docker system prune -a -f
+    fi
     echo "== systemd journal (keep 200M)"
-    do_ sudo journalctl --vacuum-size=200M
+    act "Vacuum systemd journal to 200M" \
+        "/var/log/journal ($(size_of /var/log/journal))" \
+        "Oldest logs are deleted; journalctl history becomes shorter. Needs sudo." \
+        -- sudo journalctl --vacuum-size=200M
     echo "== orphan packages (review this list before running with --run)"
-    pacman -Qtdq
-    if ((RUN)) && [[ -n $(pacman -Qtdq) ]]; then sudo pacman -Rns $(pacman -Qtdq); fi
+    local orphans; orphans=$(pacman -Qtdq 2>/dev/null)
+    if [[ -n $orphans ]]; then
+        echo "$orphans"
+        if ((RUN || INTERACTIVE)); then
+            # shellcheck disable=SC2086
+            act "Remove orphan packages" \
+                "$(echo $orphans | wc -w) packages: $(echo $orphans)" \
+                "Uninstalls packages no longer required as dependencies. Anything you use directly but was installed as a dependency disappears. pacman will still confirm. Needs sudo." \
+                -- sudo pacman -Rns $orphans
+        fi
+    else
+        echo "none"
+    fi
 }
 
 compress() {
-    local dir=${1:?usage: diskclean compress DIR [--run]}
-    find "$dir" -type f \( -name '*.csv' -o -name '*.log' -o -name '*.json' -o -name '*.txt' \) \
-        -size +50M -print0 |
+    local dir=${1:?usage: diskclean compress DIR [--run|-i]}
+    local f
+    # process substitution (not a pipe) so the loop runs in this shell and
+    # interactive answers (a/q) and counters carry over
     while IFS= read -r -d '' f; do
         echo "$(du -h "$f" | cut -f1)  $f"
-        # zstd --rm deletes the original only after a successful write; we also verify explicitly
-        if ((RUN)); then
-            zstd -T0 -10 -q "$f" -o "$f.zst" && zstd -t -q "$f.zst" && rm -- "$f" \
-                || echo "!! failed on $f, original kept"
+        # zstd only writes the archive; the original is removed after zstd -t verifies it
+        if ((RUN || INTERACTIVE)); then
+            act "Compress ${f##*/}" \
+                "$f ($(size_of "$f")) → $f.zst; original deleted after verification" \
+                "Lossless. Programs expecting the plain file must use zstdcat or unzstd first." \
+                -- compress_one "$f"
         fi
-    done
-    ((RUN)) || echo "[dry-run] files above would be compressed to .zst (read with: zstdcat FILE.zst)"
+    done < <(find "$dir" -type f \( -name '*.csv' -o -name '*.log' -o -name '*.json' -o -name '*.txt' \) \
+                  -size +50M -print0)
+    ((RUN || INTERACTIVE)) || echo "[dry-run] files above would be compressed to .zst (read with: zstdcat FILE.zst)"
+}
+
+compress_one() {
+    zstd -T0 -10 -q "$1" -o "$1.zst" && zstd -t -q "$1.zst" && rm -- "$1" \
+        || { echo "!! failed on $1, original kept"; return 1; }
 }
 
 artifacts() {
-    local dir=${1:?usage: diskclean artifacts DIR [--run]}
-    find "$dir" -xdev -type d \( -name node_modules -o -name venv -o -name .venv -o -name build \) \
-        -prune -not -path '*/.*/*' -not -path "$HOME/Downloads/*" -not -path '*/resources/*' \
-        -print0 2>/dev/null |
+    local dir=${1:?usage: diskclean artifacts DIR [--run|-i]}
+    local d
     while IFS= read -r -d '' d; do
         local proj; proj=$(dirname "$d")
         # skip projects with any non-artifact file modified in the last 60 days
         if [[ -z $(find "$proj" -path "$d" -prune -o -type f -mtime -60 -print -quit 2>/dev/null) ]]; then
             echo "$(du -sh "$d" | cut -f1)  $d"
-            do_ rm -rf -- "$d"
+            act "Remove ${d##*/} in ${proj/#"$HOME"/\~}" \
+                "$d ($(size_of "$d"))" \
+                "Project untouched 60+ days. Reinstall/rebuild (npm install, pip install -r ..., build) before using it again." \
+                -- rm -rf -- "$d"
         fi
-    done
+    done < <(find "$dir" -xdev -type d \( -name node_modules -o -name venv -o -name .venv -o -name build \) \
+                 -prune -not -path '*/.*/*' -not -path "$HOME/Downloads/*" -not -path '*/resources/*' \
+                 -print0 2>/dev/null)
 }
 
 downloads() {
@@ -108,6 +235,7 @@ case ${1:-} in
     compress)  compress "${2:-}" ;;
     artifacts) artifacts "${2:-}" ;;
     downloads) downloads ;;
-    -h|--help|help) sed -n "2,13s/^# \\{0,1\\}//p" "$0" ;;
-    *)         sed -n "2,13s/^# \\{0,1\\}//p" "$0" >&2; exit 1 ;;
+    -h|--help|help) sed -n "2,14s/^# \\{0,1\\}//p" "$0" ;;
+    *)         sed -n "2,14s/^# \\{0,1\\}//p" "$0" >&2; exit 1 ;;
 esac
+summary
